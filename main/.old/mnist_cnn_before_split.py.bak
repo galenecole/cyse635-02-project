@@ -1,0 +1,1260 @@
+"""MNIST CNN classifier (PyTorch) with analysis outputs.
+
+Run:  python mnist_cnn.py
+Output folder: ./outputs/run_YYYYMMDD_HHMMSS (one new folder for each run)
+Output files: training curves, confusion matrix, filters, feature maps,
+misclassified samples, hyperparameter sweep, results.json, best_model.pt
+"""
+import argparse
+import json
+import os
+import platform
+import struct
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")  # Use a file-only backend. No display is necessary.
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as functional
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+#  constants
+PROJECT_ROOT_DIRECTORY = Path(__file__).parent
+DATASET_DIRECTORY = PROJECT_ROOT_DIRECTORY / "mnist"
+OUTPUT_ROOT_DIRECTORY = PROJECT_ROOT_DIRECTORY / "outputs"
+OUTPUT_ROOT_DIRECTORY.mkdir(exist_ok=True)
+RUN_DIRECTORY_PREFIX = "run_"  # Each run folder name is this prefix plus a timestamp.
+
+RANDOM_SEED = 42
+COMPUTE_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUMBER_OF_CLASSES = 10
+MNIST_PIXEL_MEAN = 0.1307  # Mean of all MNIST training pixels.
+MNIST_PIXEL_STANDARD_DEVIATION = 0.3081  # Standard deviation of all MNIST training pixels.
+
+torch.manual_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+
+
+#  progress helpers
+def format_duration(duration_in_seconds):
+    """Convert a duration in seconds to the text format H:MM:SS.
+
+    Input:
+        duration_in_seconds (float): Duration to convert.
+    Output:
+        str: Duration as hours, minutes, and seconds. Example: "1:05:09".
+    """
+    total_whole_seconds = int(round(duration_in_seconds))
+    hours_part, remainder_seconds = divmod(total_whole_seconds, 3600)
+    minutes_part, seconds_part = divmod(remainder_seconds, 60)
+    return f"{hours_part}:{minutes_part:02d}:{seconds_part:02d}"
+
+
+CONSOLE_WIDTH_IN_CHARACTERS = 78  # Width of the rules and the largest width of a progress line.
+NUMBER_OF_RUN_SECTIONS = 6  # Number of tasks that run_experiment shows with a section header.
+
+
+def print_heading(heading_text):
+    """Print a heading between two full-width rules.
+
+    Input:
+        heading_text (str): Text of the heading.
+    Output:
+        None. The function prints to the console.
+    """
+    rule_line = "=" * CONSOLE_WIDTH_IN_CHARACTERS
+    print(f"\n{rule_line}\n {heading_text}\n{rule_line}")
+
+
+def print_section_header(section_number, total_section_count, section_title):
+    """Print a header line that shows the start of a new task of the run.
+
+    The line shows the task number, the task title, and the current clock time.
+    Example: "-- [2/6] Training the main model ------------------ 14:05:12"
+
+    Inputs:
+        section_number (int): Number of this task.
+        total_section_count (int): Total number of tasks.
+        section_title (str): Short title of the task.
+    Output:
+        None. The function prints to the console.
+    """
+    header_text = f"[{section_number}/{total_section_count}] {section_title}"
+    clock_time_text = time.strftime("%H:%M:%S")
+    # The fixed text uses 5 characters: "-- " before the title and 2 spaces around the fill.
+    fill_character_count = max(
+        CONSOLE_WIDTH_IN_CHARACTERS - len(header_text) - len(clock_time_text) - 5, 3)
+    print(f"\n-- {header_text} {'-' * fill_character_count} {clock_time_text}")
+
+
+def print_labeled_value(label_text, value_text, indent_in_characters=2,
+                        label_width_in_characters=16):
+    """Print one line in the format "label : value" with aligned colons.
+
+    Inputs:
+        label_text (str): Name of the value.
+        value_text (object): Value to show. The function converts it to text.
+        indent_in_characters (int): Number of spaces before the label.
+        label_width_in_characters (int): Width of the label column.
+    Output:
+        None. The function prints to the console.
+    """
+    print(f"{' ' * indent_in_characters}{label_text:<{label_width_in_characters}}: {value_text}")
+
+
+def clear_console_line():
+    """Remove the text of the current console line and move the cursor to its start.
+
+    Use this function before a message is printed over an open progress bar.
+
+    Input:
+        None.
+    Output:
+        None. The function prints to the console.
+    """
+    print("\r" + " " * CONSOLE_WIDTH_IN_CHARACTERS + "\r", end="", flush=True)
+
+
+def print_progress_bar(completed_step_count, total_step_count, start_time_in_seconds,
+                       label_text, bar_width_in_characters=20, keep_line_open=False):
+    """Print a text progress bar on the current console line.
+
+    The line shows the bar, the step count, the completed percentage, and the
+    times as "elapsed<remaining". The remaining time is an estimate from the
+    mean time of each completed step. Each call replaces the previous bar.
+
+    Inputs:
+        completed_step_count (int): Number of steps that are complete.
+        total_step_count (int): Total number of steps in the loop.
+        start_time_in_seconds (float): Value of time.time() when the loop started.
+        label_text (str): Text to show before the bar.
+        bar_width_in_characters (int): Width of the bar in characters.
+        keep_line_open (bool): When False, the function starts a new line after
+            the last step. When True, the line stays open so the caller can
+            replace it with a summary.
+    Output:
+        None. The function prints to the console.
+    """
+    completed_fraction = completed_step_count / total_step_count
+    filled_character_count = int(bar_width_in_characters * completed_fraction)
+    bar_text = "#" * filled_character_count + "." * (bar_width_in_characters - filled_character_count)
+    elapsed_seconds = time.time() - start_time_in_seconds
+    if completed_step_count > 0:
+        # Estimate the remaining time from the mean time of each completed step.
+        remaining_time_text = format_duration(
+            elapsed_seconds / completed_step_count * (total_step_count - completed_step_count))
+    else:
+        remaining_time_text = "?:??:??"  # No step is complete. An estimate is not possible.
+    line_ends_here = completed_step_count == total_step_count and not keep_line_open
+    print(f"\r{label_text} [{bar_text}] {completed_step_count}/{total_step_count} "
+          f"{completed_fraction:>4.0%} {format_duration(elapsed_seconds)}<{remaining_time_text}",
+          end="\n" if line_ends_here else "", flush=True)
+
+
+def create_new_run_directory():
+    """Create a new timestamped folder for the outputs of this run.
+
+    Input:
+        None.
+    Output:
+        Path: The new folder, for example outputs/run_20261103_141500.
+    """
+    timestamp_text = time.strftime("%Y%m%d_%H%M%S")
+    new_run_directory = OUTPUT_ROOT_DIRECTORY / f"{RUN_DIRECTORY_PREFIX}{timestamp_text}"
+    new_run_directory.mkdir(exist_ok=False)
+    return new_run_directory
+
+
+def find_most_recent_completed_run_directory():
+    """Find the newest run folder that contains a results.json file.
+
+    The timestamp in the folder name gives the creation order.
+    A folder without results.json is an incomplete run. The function skips it.
+
+    Input:
+        None. The function reads the folders in OUTPUT_ROOT_DIRECTORY.
+    Output:
+        Path or None: The newest completed run folder.
+        None if no completed run folder exists.
+    """
+    completed_run_directories = sorted(
+        directory_path for directory_path in OUTPUT_ROOT_DIRECTORY.glob(f"{RUN_DIRECTORY_PREFIX}*")
+        if directory_path.is_dir() and (directory_path / "results.json").exists())
+    return completed_run_directories[-1] if completed_run_directories else None
+
+
+def detect_cpu_name():
+    """Find the marketing name of the processor, for example "AMD Ryzen 7 5800X".
+
+    The function uses the registry on Windows, sysctl on macOS, and /proc/cpuinfo
+    on Linux. If these sources fail, it uses the generic text from platform.processor().
+
+    Input:
+        None.
+    Output:
+        str: Name of the processor. "unknown CPU" if no source gives a name.
+    """
+    try:
+        if sys.platform == "win32":
+            import winreg  # Only available on Windows.
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as registry_key:
+                processor_name, _ = winreg.QueryValueEx(registry_key, "ProcessorNameString")
+            return " ".join(processor_name.split())  # Remove the extra spaces.
+        if sys.platform == "darwin":
+            return subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+        with open("/proc/cpuinfo") as cpu_information_file:
+            for line_text in cpu_information_file:
+                if line_text.startswith("model name"):
+                    return line_text.split(":", 1)[1].strip()
+    except (OSError, ImportError, ValueError, subprocess.SubprocessError):
+        pass  # Use the fallback below.
+    return platform.processor() or "unknown CPU"
+
+
+def describe_compute_device(device_to_describe=None):
+    """Return a short text that names a device that can run the computation.
+
+    Input:
+        device_to_describe (torch.device or None): Device to describe.
+            None gives the device that this run uses (COMPUTE_DEVICE).
+    Output:
+        str: "GPU: name (memory in GB)" for a GPU.
+            "CPU: name (number of threads)" for the CPU.
+    """
+    if device_to_describe is None:
+        device_to_describe = COMPUTE_DEVICE
+    if device_to_describe.type == "cuda":
+        gpu_properties = torch.cuda.get_device_properties(device_to_describe)
+        return f"GPU: {gpu_properties.name} ({gpu_properties.total_memory / 1024 ** 3:.1f} GB)"
+    return f"CPU: {detect_cpu_name()} ({os.cpu_count()} threads)"
+
+
+def list_available_compute_devices():
+    """List the devices that PyTorch can use on this computer.
+
+    Input:
+        None.
+    Output:
+        list of torch.device: Each GPU first (cuda:0, cuda:1, ...), then the CPU.
+            The CPU is always in the list. The first item is the default device.
+    """
+    available_devices = [torch.device("cuda", gpu_index)
+                         for gpu_index in range(torch.cuda.device_count())]
+    available_devices.append(torch.device("cpu"))
+    return available_devices
+
+
+def convert_text_to_device(requested_device_text, available_devices):
+    """Convert the text of the --device option to one of the available devices.
+
+    Inputs:
+        requested_device_text (str): "cpu", "gpu", "cuda", or "cuda:N" (N is a GPU index).
+            "gpu" and "cuda" mean the first GPU (cuda:0).
+        available_devices (list of torch.device): Devices from list_available_compute_devices.
+    Output:
+        torch.device or None: The matching device. None if the text is not valid
+        or the device is not available on this computer.
+    """
+    normalized_text = requested_device_text.strip().lower()
+    if normalized_text in ("gpu", "cuda"):
+        normalized_text = "cuda:0"
+    for available_device in available_devices:
+        if normalized_text == str(available_device):  # str() gives "cpu" or "cuda:N".
+            return available_device
+    return None
+
+
+def select_compute_device(requested_device_text=None):
+    """Choose the device for this run. Ask the user if more than one device exists.
+
+    Rules:
+        1. If requested_device_text is given (--device option), use it and do not ask.
+        2. If only the CPU is available, use it and do not ask.
+        3. If the input is not interactive (no console), use the default device
+           (the first GPU) and do not ask.
+        4. Otherwise, show a numbered list and ask. The Enter key gives the default.
+
+    Input:
+        requested_device_text (str or None): Value of the --device option.
+    Output:
+        torch.device: The device that the run uses.
+    Raises:
+        SystemExit: If requested_device_text is not valid or not available.
+    """
+    available_devices = list_available_compute_devices()
+    device_labels = [
+        describe_compute_device(device) + (f"  [{device}]" if device.type == "cuda" else "")
+        for device in available_devices]
+
+    print_heading("Device selection")
+    if requested_device_text is not None:
+        chosen_device = convert_text_to_device(requested_device_text, available_devices)
+        if chosen_device is None:
+            valid_choices = ", ".join(str(device) for device in available_devices)
+            raise SystemExit(f"The device '{requested_device_text}' is not available. "
+                             f"Valid choices on this computer: {valid_choices} (or 'gpu').")
+        print(f"  Device set with --device: {describe_compute_device(chosen_device)}")
+        return chosen_device
+    if len(available_devices) == 1:
+        print("  No GPU found. The run uses the CPU.")
+        print(f"  {device_labels[0]}")
+        return available_devices[0]
+    if not sys.stdin.isatty():
+        print("  The input is not interactive. The run uses the default device.")
+        print(f"  {device_labels[0]}")
+        return available_devices[0]
+
+    print("  More than one device is available.\n")
+    for option_number, device_label in enumerate(device_labels, start=1):
+        default_marker = "  (default)" if option_number == 1 else ""
+        print(f"    [{option_number}] {device_label}{default_marker}")
+    while True:
+        try:
+            answer_text = input(f"\n  Select a device (1-{len(available_devices)}, "
+                                "Enter for the default): ").strip()
+        except EOFError:  # The input closed. Use the default device.
+            answer_text = ""
+        if answer_text == "":
+            return available_devices[0]
+        if answer_text.isdigit() and 1 <= int(answer_text) <= len(available_devices):
+            return available_devices[int(answer_text) - 1]
+        print(f"  '{answer_text}' is not valid. Enter a number from 1 to {len(available_devices)}.")
+
+
+def load_previous_run_timings():
+    """Read the durations and the device of the last complete run.
+
+    The function reads results.json from the newest completed run folder.
+    If no run folder exists, it reads OUTPUT_ROOT_DIRECTORY / "results.json"
+    (the location that earlier versions of this script used).
+
+    Input:
+        None.
+    Output:
+        tuple of 3 items:
+            previous_total_duration_in_seconds (float or None): Total duration.
+                None if no previous run exists.
+                Older files without the total duration give the main training time.
+            previous_component_durations (dict): Component name -> seconds.
+                The dict is empty if the file has no component durations.
+            previous_device_description (str): Device of the last run.
+                "unknown" if the file does not record the device.
+    """
+    most_recent_run_directory = find_most_recent_completed_run_directory()
+    if most_recent_run_directory is not None:
+        previous_results_path = most_recent_run_directory / "results.json"
+    else:
+        previous_results_path = OUTPUT_ROOT_DIRECTORY / "results.json"  # Older location.
+    if not previous_results_path.exists():
+        return None, {}, "unknown"
+    try:
+        previous_results = json.loads(previous_results_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None, {}, "unknown"  # The file is damaged. Ignore it.
+    previous_total_duration_in_seconds = previous_results.get(
+        "total_run_time_s", previous_results.get("train_time_s"))
+    return (previous_total_duration_in_seconds,
+            previous_results.get("component_durations_s", {}),
+            previous_results.get("device", "unknown"))
+
+
+def record_component_duration(component_durations_in_seconds, component_name,
+                              component_start_time_in_seconds):
+    """Store the duration of one run component, print it, and start the next one.
+
+    Inputs:
+        component_durations_in_seconds (dict): Component name -> seconds.
+            The function adds one entry to this dict.
+        component_name (str): Name of the component that just ended.
+        component_start_time_in_seconds (float): Value of time.time() when
+            the component started.
+    Output:
+        float: The current time. Use it as the start time of the next component.
+    """
+    current_time_in_seconds = time.time()
+    component_durations_in_seconds[component_name] = (
+        current_time_in_seconds - component_start_time_in_seconds)
+    print(f"  Finished in {format_duration(component_durations_in_seconds[component_name])}.")
+    return current_time_in_seconds
+
+
+def print_duration_summary(component_durations_in_seconds, total_duration_in_seconds,
+                           previous_component_durations_in_seconds,
+                           previous_total_duration_in_seconds,
+                           current_device_description, previous_device_description):
+    """Print a table of the duration of each component and the total duration.
+
+    Inputs:
+        component_durations_in_seconds (dict): Component name -> seconds, this run.
+        total_duration_in_seconds (float): Total duration of this run.
+        previous_component_durations_in_seconds (dict): Same format, last run.
+            Can be empty.
+        previous_total_duration_in_seconds (float or None): Total of the last run.
+        current_device_description (str): Device of this run.
+        previous_device_description (str): Device of the last run, or "unknown".
+    Output:
+        None. The function prints to the console.
+    """
+    name_column_width = max(len(name) for name in component_durations_in_seconds)
+    name_column_width = max(name_column_width, len("TOTAL"))
+    print_heading("Run time summary (H:MM:SS)")
+    print_labeled_value("This run device", current_device_description)
+    print_labeled_value("Last run device", previous_device_description)
+    if (previous_total_duration_in_seconds is not None
+            and previous_device_description != current_device_description):
+        print("  Note: the devices are different. Do not compare the times directly.")
+    print()
+    print(f"  {'Component':<{name_column_width}}  {'This run':>9}  {'Share':>6}  {'Last run':>9}")
+    print("  " + "-" * (name_column_width + 30))
+    for component_name, component_duration in component_durations_in_seconds.items():
+        previous_duration = previous_component_durations_in_seconds.get(component_name)
+        previous_duration_text = (
+            format_duration(previous_duration) if previous_duration is not None else "-")
+        share_of_total = component_duration / total_duration_in_seconds
+        print(f"  {component_name:<{name_column_width}}  "
+              f"{format_duration(component_duration):>9}  {share_of_total:>6.1%}  "
+              f"{previous_duration_text:>9}")
+    previous_total_text = (
+        format_duration(previous_total_duration_in_seconds)
+        if previous_total_duration_in_seconds is not None else "-")
+    print("  " + "-" * (name_column_width + 30))
+    print(f"  {'TOTAL':<{name_column_width}}  "
+          f"{format_duration(total_duration_in_seconds):>9}  {1.0:>6.1%}  "
+          f"{previous_total_text:>9}")
+
+
+#  data
+def read_idx_file(idx_file_path):
+    """Read an IDX file and return its content as a numpy array.
+
+    Input:
+        idx_file_path (Path): Location of an MNIST IDX file (images or labels).
+    Output:
+        numpy.ndarray (uint8): Array with the shape that the file header defines.
+            Image files give (number_of_images, 28, 28).
+            Label files give (number_of_labels,).
+    """
+    with open(idx_file_path, "rb") as idx_file_handle:
+        # The header has 4 bytes: 2 zero bytes, a data type code, and the number of dimensions.
+        _, _, _, number_of_dimensions_in_file = struct.unpack(">BBBB", idx_file_handle.read(4))
+        # Each dimension size is a 4-byte big-endian integer.
+        size_of_each_dimension = struct.unpack(
+            ">" + "I" * number_of_dimensions_in_file,
+            idx_file_handle.read(4 * number_of_dimensions_in_file))
+        raw_data_bytes = idx_file_handle.read()
+        return np.frombuffer(raw_data_bytes, dtype=np.uint8).reshape(size_of_each_dimension)
+
+
+def normalize_images(raw_pixel_images):
+    """Scale pixels to [0, 1], standardize them, and add a channel dimension.
+
+    Input:
+        raw_pixel_images (numpy.ndarray): Pixel values from 0 to 255.
+            Shape: (number_of_images, 28, 28).
+    Output:
+        torch.Tensor (float32): Standardized images.
+            Shape: (number_of_images, 1, 28, 28).
+    """
+    images_scaled_to_unit_range = torch.tensor(raw_pixel_images, dtype=torch.float32) / 255.0
+    images_standardized = (
+        (images_scaled_to_unit_range - MNIST_PIXEL_MEAN) / MNIST_PIXEL_STANDARD_DEVIATION)
+    return images_standardized.unsqueeze(1)  # Add the channel dimension.
+
+
+def load_mnist_data():
+    """Load the four MNIST files and return the training and test tensors.
+
+    Input:
+        None. The function reads the files in DATASET_DIRECTORY.
+    Output:
+        tuple of 4 tensors:
+            training_images_tensor (float32): Shape (60000, 1, 28, 28).
+            training_labels_tensor (int64): Shape (60000,).
+            test_images_tensor (float32): Shape (10000, 1, 28, 28).
+            test_labels_tensor (int64): Shape (10000,).
+    """
+    training_images_raw = read_idx_file(DATASET_DIRECTORY / "train-images.idx3-ubyte")
+    training_labels_raw = read_idx_file(DATASET_DIRECTORY / "train-labels.idx1-ubyte")
+    test_images_raw = read_idx_file(DATASET_DIRECTORY / "t10k-images.idx3-ubyte")
+    test_labels_raw = read_idx_file(DATASET_DIRECTORY / "t10k-labels.idx1-ubyte")
+    return (
+        normalize_images(training_images_raw),
+        torch.tensor(training_labels_raw, dtype=torch.long),
+        normalize_images(test_images_raw),
+        torch.tensor(test_labels_raw, dtype=torch.long),
+    )
+
+
+def augment_batch(batch_of_images, maximum_pixel_shift=2):
+    """Shift a full batch of images by a random number of pixels.
+
+    One shift value applies to all images in the batch.
+    Pixels that leave one edge enter at the opposite edge.
+
+    Inputs:
+        batch_of_images (torch.Tensor): Shape (batch_size, 1, 28, 28).
+        maximum_pixel_shift (int): Largest shift in pixels for each axis.
+    Output:
+        torch.Tensor: Shifted images. The shape is the same as the input.
+    """
+    random_horizontal_shift_in_pixels, random_vertical_shift_in_pixels = np.random.randint(
+        -maximum_pixel_shift, maximum_pixel_shift + 1, 2)
+    return torch.roll(
+        batch_of_images,
+        shifts=(int(random_vertical_shift_in_pixels), int(random_horizontal_shift_in_pixels)),
+        dims=(2, 3))  # Dimension 2 is height. Dimension 3 is width.
+
+
+#  model
+class ConvolutionBlock(nn.Module):
+    """Two (convolution, batch normalization, ReLU) stages, then max pooling and dropout."""
+
+    def __init__(self, number_of_input_channels, number_of_output_channels,
+                 spatial_dropout_probability):
+        """Create the layers of the block.
+
+        Inputs:
+            number_of_input_channels (int): Channels that enter the block.
+            number_of_output_channels (int): Channels that each convolution produces.
+            spatial_dropout_probability (float): Chance to drop a complete feature map.
+        Output:
+            None.
+        """
+        super().__init__()
+        self.first_convolution_layer = nn.Conv2d(
+            number_of_input_channels, number_of_output_channels, 3, padding=1, bias=False)
+        self.first_batch_normalization_layer = nn.BatchNorm2d(number_of_output_channels)
+        self.second_convolution_layer = nn.Conv2d(
+            number_of_output_channels, number_of_output_channels, 3, padding=1, bias=False)
+        self.second_batch_normalization_layer = nn.BatchNorm2d(number_of_output_channels)
+        # Dropout2d removes complete feature maps, not single pixels.
+        self.spatial_dropout_layer = nn.Dropout2d(spatial_dropout_probability)
+
+    def forward(self, input_feature_maps):
+        """Run the block on a batch of feature maps.
+
+        Input:
+            input_feature_maps (torch.Tensor): Shape (batch, input_channels, H, W).
+        Output:
+            torch.Tensor: Shape (batch, output_channels, H / 2, W / 2).
+        """
+        first_stage_activations = functional.relu(self.first_batch_normalization_layer(
+            self.first_convolution_layer(input_feature_maps)))
+        second_stage_activations = functional.relu(self.second_batch_normalization_layer(
+            self.second_convolution_layer(first_stage_activations)))
+        pooled_activations = functional.max_pool2d(second_stage_activations, 2)  # Halve height and width.
+        return self.spatial_dropout_layer(pooled_activations)
+
+
+class MnistConvolutionalNetwork(nn.Module):
+    """Two convolution blocks followed by two fully connected layers."""
+
+    def __init__(self, first_block_channels=32, second_block_channels=64,
+                 hidden_units=128, convolution_dropout=0.1, fully_connected_dropout=0.4):
+        """Create the layers of the network.
+
+        Inputs:
+            first_block_channels (int): Channels in the first convolution block.
+            second_block_channels (int): Channels in the second convolution block.
+            hidden_units (int): Neurons in the hidden fully connected layer.
+            convolution_dropout (float): Feature map drop chance in the convolution blocks.
+            fully_connected_dropout (float): Neuron drop chance after the hidden layer.
+        Output:
+            None.
+        """
+        super().__init__()
+        self.first_convolution_block = ConvolutionBlock(
+            1, first_block_channels, convolution_dropout)  # Image size: 28 -> 14.
+        self.second_convolution_block = ConvolutionBlock(
+            first_block_channels, second_block_channels, convolution_dropout)  # Image size: 14 -> 7.
+        self.hidden_fully_connected_layer = nn.Linear(
+            second_block_channels * 7 * 7, hidden_units)
+        self.hidden_dropout_layer = nn.Dropout(fully_connected_dropout)
+        self.output_fully_connected_layer = nn.Linear(hidden_units, NUMBER_OF_CLASSES)
+
+    def forward(self, batch_of_images):
+        """Run the network on a batch of images.
+
+        Input:
+            batch_of_images (torch.Tensor): Shape (batch_size, 1, 28, 28).
+        Output:
+            torch.Tensor: Class scores (logits). Shape (batch_size, 10).
+        """
+        final_feature_maps = self.second_convolution_block(
+            self.first_convolution_block(batch_of_images))
+        hidden_layer_activations = functional.relu(
+            self.hidden_fully_connected_layer(final_feature_maps.flatten(1)))
+        return self.output_fully_connected_layer(
+            self.hidden_dropout_layer(hidden_layer_activations))
+
+
+#  train / evaluate
+@torch.no_grad()
+def evaluate_model(model_to_evaluate, data_loader_to_evaluate):
+    """Measure the loss and the accuracy of a model on a data set.
+
+    Inputs:
+        model_to_evaluate (nn.Module): The network to test.
+        data_loader_to_evaluate (DataLoader): Batches of (images, labels).
+    Output:
+        tuple of 4 items:
+            mean_loss_per_sample (float): Mean cross-entropy loss.
+            accuracy_fraction (float): Fraction of correct predictions, 0 to 1.
+            predicted_labels_array (numpy.ndarray): Predicted class for each sample.
+            true_labels_array (numpy.ndarray): True class for each sample.
+    """
+    model_to_evaluate.eval()  # Disable dropout. Use the batch normalization running statistics.
+    total_summed_loss = 0.0
+    total_correct_prediction_count = 0
+    total_sample_count = 0
+    list_of_predicted_label_batches = []
+    list_of_true_label_batches = []
+    for batch_of_images, batch_of_true_labels in data_loader_to_evaluate:
+        batch_of_images = batch_of_images.to(COMPUTE_DEVICE)
+        batch_of_true_labels = batch_of_true_labels.to(COMPUTE_DEVICE)
+        batch_of_logits = model_to_evaluate(batch_of_images)
+        # Use the sum here. The final division by the sample count gives the exact mean.
+        total_summed_loss += functional.cross_entropy(
+            batch_of_logits, batch_of_true_labels, reduction="sum").item()
+        batch_of_predicted_labels = batch_of_logits.argmax(1)
+        total_correct_prediction_count += (
+            batch_of_predicted_labels == batch_of_true_labels).sum().item()
+        total_sample_count += len(batch_of_true_labels)
+        list_of_predicted_label_batches.append(batch_of_predicted_labels.cpu())
+        list_of_true_label_batches.append(batch_of_true_labels.cpu())
+    return (total_summed_loss / total_sample_count,
+            total_correct_prediction_count / total_sample_count,
+            torch.cat(list_of_predicted_label_batches).numpy(),
+            torch.cat(list_of_true_label_batches).numpy())
+
+
+def train_model(model_configuration, training_dataset, validation_dataset,
+                maximum_number_of_epochs=30, early_stopping_patience_in_epochs=5,
+                print_progress=True):
+    """Train a network and return the best model and the training history.
+
+    Optimizer: AdamW with weight decay.
+    Learning rate schedule: cosine annealing.
+    Early stopping: stop when the validation loss does not improve
+    for `early_stopping_patience_in_epochs` epochs. Then restore the best weights.
+
+    Inputs:
+        model_configuration (dict): Hyperparameters. Required keys:
+            first_block_channels, second_block_channels, hidden_units,
+            convolution_dropout, fully_connected_dropout, learning_rate,
+            weight_decay, batch_size. Optional key: use_augmentation.
+        training_dataset (Dataset): Training samples (image, label).
+        validation_dataset (Dataset): Validation samples (image, label).
+        maximum_number_of_epochs (int): Upper limit of training epochs.
+        early_stopping_patience_in_epochs (int): Epochs to wait for an improvement.
+        print_progress (bool): Print one line for each epoch when True.
+    Output:
+        tuple of 2 items:
+            trained_model (nn.Module): Network with the best validation weights.
+            training_history (dict): Lists of train_loss, train_acc, val_loss, val_acc.
+    """
+    trained_model = MnistConvolutionalNetwork(
+        model_configuration["first_block_channels"],
+        model_configuration["second_block_channels"],
+        model_configuration["hidden_units"],
+        model_configuration["convolution_dropout"],
+        model_configuration["fully_connected_dropout"],
+    ).to(COMPUTE_DEVICE)
+    adamw_optimizer = torch.optim.AdamW(
+        trained_model.parameters(),
+        lr=model_configuration["learning_rate"],
+        weight_decay=model_configuration["weight_decay"])
+    cosine_learning_rate_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        adamw_optimizer, T_max=maximum_number_of_epochs)
+    training_data_loader = DataLoader(
+        training_dataset, batch_size=model_configuration["batch_size"], shuffle=True)
+    validation_data_loader = DataLoader(validation_dataset, batch_size=1000)
+
+    training_history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    lowest_validation_loss_so_far = float("inf")
+    best_model_weights_so_far = None
+    number_of_epochs_without_improvement = 0
+
+    if print_progress:
+        print(f"  {'Epoch':<7}| {'Train loss':>10} | {'Train acc':>9} | "
+              f"{'Val loss':>8} | {'Val acc':>7} | {'Time':>7}")
+        print("  " + "-" * 62)
+    for current_epoch_number in range(1, maximum_number_of_epochs + 1):
+        trained_model.train()  # Enable dropout and batch normalization updates.
+        epoch_summed_training_loss = 0.0
+        epoch_correct_training_predictions = 0
+        epoch_training_sample_count = 0
+        epoch_start_time_in_seconds = time.time()
+        total_batches_in_epoch = len(training_data_loader)
+        for batch_index, (batch_of_images, batch_of_true_labels) in enumerate(training_data_loader):
+            batch_of_images = batch_of_images.to(COMPUTE_DEVICE)
+            batch_of_true_labels = batch_of_true_labels.to(COMPUTE_DEVICE)
+            if model_configuration.get("use_augmentation", True):
+                batch_of_images = augment_batch(batch_of_images)
+            adamw_optimizer.zero_grad()  # Remove the gradients of the previous batch.
+            batch_of_logits = trained_model(batch_of_images)
+            mean_batch_loss = functional.cross_entropy(batch_of_logits, batch_of_true_labels)
+            mean_batch_loss.backward()  # Compute the gradients.
+            adamw_optimizer.step()  # Update the weights.
+            epoch_summed_training_loss += mean_batch_loss.item() * len(batch_of_true_labels)
+            epoch_correct_training_predictions += (
+                batch_of_logits.argmax(1) == batch_of_true_labels).sum().item()
+            epoch_training_sample_count += len(batch_of_true_labels)
+            if print_progress:
+                print_progress_bar(
+                    batch_index + 1, total_batches_in_epoch, epoch_start_time_in_seconds,
+                    f"  epoch {current_epoch_number:02d}/{maximum_number_of_epochs:02d}",
+                    keep_line_open=True)
+        cosine_learning_rate_scheduler.step()
+
+        epoch_validation_loss, epoch_validation_accuracy, _, _ = evaluate_model(
+            trained_model, validation_data_loader)
+        epoch_mean_training_loss = epoch_summed_training_loss / epoch_training_sample_count
+        epoch_training_accuracy = epoch_correct_training_predictions / epoch_training_sample_count
+        for history_key, history_value in zip(
+                training_history,
+                (epoch_mean_training_loss, epoch_training_accuracy,
+                 epoch_validation_loss, epoch_validation_accuracy)):
+            training_history[history_key].append(history_value)
+
+        if print_progress:
+            epoch_label_text = f"{current_epoch_number:02d}/{maximum_number_of_epochs:02d}"
+            epoch_duration_text = format_duration(time.time() - epoch_start_time_in_seconds)
+            clear_console_line()  # Replace the progress bar with the summary row.
+            print(f"  {epoch_label_text:<7}| {epoch_mean_training_loss:>10.4f} | "
+                  f"{epoch_training_accuracy:>9.2%} | {epoch_validation_loss:>8.4f} | "
+                  f"{epoch_validation_accuracy:>7.2%} | {epoch_duration_text:>7}")
+
+        if epoch_validation_loss < lowest_validation_loss_so_far:
+            lowest_validation_loss_so_far = epoch_validation_loss
+            number_of_epochs_without_improvement = 0
+            # Copy the weights. A reference changes when training continues.
+            best_model_weights_so_far = {
+                parameter_name: parameter_tensor.clone()
+                for parameter_name, parameter_tensor in trained_model.state_dict().items()}
+        else:
+            number_of_epochs_without_improvement += 1
+            if number_of_epochs_without_improvement >= early_stopping_patience_in_epochs:
+                if print_progress:
+                    print(f"  Early stopping: no validation improvement for "
+                          f"{early_stopping_patience_in_epochs} epochs. Best weights restored.")
+                break
+
+    trained_model.load_state_dict(best_model_weights_so_far)
+    return trained_model, training_history
+
+
+#  plots
+def plot_training_history(training_history, output_image_path):
+    """Plot the loss and the accuracy for each epoch and save the figure.
+
+    Inputs:
+        training_history (dict): Lists of train_loss, train_acc, val_loss, val_acc.
+        output_image_path (Path): Location of the PNG file to write.
+    Output:
+        None. The function writes one image file.
+    """
+    history_figure, history_axes = plt.subplots(1, 2, figsize=(10, 4))
+    epoch_numbers = range(1, len(training_history["train_loss"]) + 1)
+    history_axes[0].plot(epoch_numbers, training_history["train_loss"], label="train")
+    history_axes[0].plot(epoch_numbers, training_history["val_loss"], label="validation")
+    history_axes[0].set(title="Loss", xlabel="Epoch", ylabel="Cross-entropy")
+    history_axes[1].plot(epoch_numbers, training_history["train_acc"], label="train")
+    history_axes[1].plot(epoch_numbers, training_history["val_acc"], label="validation")
+    history_axes[1].set(title="Accuracy", xlabel="Epoch", ylabel="Accuracy")
+    for single_axis in history_axes:
+        single_axis.legend()
+        single_axis.grid(alpha=0.3)
+    history_figure.tight_layout()
+    history_figure.savefig(output_image_path, dpi=150)
+    plt.close(history_figure)
+
+
+def compute_confusion_matrix(true_labels_array, predicted_labels_array):
+    """Count the predictions for each pair of true class and predicted class.
+
+    Inputs:
+        true_labels_array (numpy.ndarray): True class for each sample.
+        predicted_labels_array (numpy.ndarray): Predicted class for each sample.
+    Output:
+        numpy.ndarray (int): Matrix of shape (10, 10).
+            Rows are true classes. Columns are predicted classes.
+    """
+    confusion_count_matrix = np.zeros((NUMBER_OF_CLASSES, NUMBER_OF_CLASSES), dtype=int)
+    # add.at counts repeated index pairs correctly.
+    np.add.at(confusion_count_matrix, (true_labels_array, predicted_labels_array), 1)
+    return confusion_count_matrix
+
+
+def plot_confusion_matrix(confusion_count_matrix, output_image_path):
+    """Draw the confusion matrix with the count in each cell and save the figure.
+
+    Inputs:
+        confusion_count_matrix (numpy.ndarray): Matrix of shape (10, 10).
+        output_image_path (Path): Location of the PNG file to write.
+    Output:
+        None. The function writes one image file.
+    """
+    matrix_figure, matrix_axis = plt.subplots(figsize=(6, 5))
+    matrix_image_handle = matrix_axis.imshow(confusion_count_matrix, cmap="Blues")
+    matrix_axis.set(xlabel="Predicted", ylabel="True", title="Confusion matrix (test set)",
+                    xticks=range(NUMBER_OF_CLASSES), yticks=range(NUMBER_OF_CLASSES))
+    for true_class_index in range(NUMBER_OF_CLASSES):
+        for predicted_class_index in range(NUMBER_OF_CLASSES):
+            cell_count = confusion_count_matrix[true_class_index, predicted_class_index]
+            # Use white text on dark cells so the number stays readable.
+            cell_text_color = "white" if cell_count > confusion_count_matrix.max() / 2 else "black"
+            matrix_axis.text(predicted_class_index, true_class_index, cell_count,
+                             ha="center", va="center", fontsize=7, color=cell_text_color)
+    matrix_figure.colorbar(matrix_image_handle)
+    matrix_figure.tight_layout()
+    matrix_figure.savefig(output_image_path, dpi=150)
+    plt.close(matrix_figure)
+
+
+def plot_first_layer_filters(trained_model, output_image_path):
+    """Draw the 3x3 filters of the first convolution layer and save the figure.
+
+    Inputs:
+        trained_model (MnistConvolutionalNetwork): Network with trained weights.
+        output_image_path (Path): Location of the PNG file to write.
+    Output:
+        None. The function writes one image file.
+    """
+    first_layer_filter_weights = (
+        trained_model.first_convolution_block.first_convolution_layer
+        .weight.detach().cpu().numpy())  # Shape: (channels, 1, 3, 3).
+    filters_figure, filters_axes = plt.subplots(4, 8, figsize=(8, 4.4))
+    for single_axis, single_filter_weights in zip(filters_axes.flat, first_layer_filter_weights):
+        single_axis.imshow(single_filter_weights[0], cmap="gray")
+        single_axis.axis("off")
+    filters_figure.suptitle("First-layer 3x3 convolution filters")
+    filters_figure.tight_layout()
+    filters_figure.savefig(output_image_path, dpi=150)
+    plt.close(filters_figure)
+
+
+@torch.no_grad()
+def plot_feature_maps(trained_model, single_input_image, output_image_path):
+    """Draw the first 8 channels of three convolution layers for one image.
+
+    Inputs:
+        trained_model (MnistConvolutionalNetwork): Network with trained weights.
+        single_input_image (torch.Tensor): One image. Shape (1, 28, 28).
+        output_image_path (Path): Location of the PNG file to write.
+    Output:
+        None. The function writes one image file.
+    """
+    trained_model.eval()
+    batch_with_one_image = single_input_image.unsqueeze(0).to(COMPUTE_DEVICE)
+    first_block = trained_model.first_convolution_block
+    second_block = trained_model.second_convolution_block
+    # Repeat the forward steps by hand to capture the intermediate activations.
+    first_convolution_feature_maps = functional.relu(first_block.first_batch_normalization_layer(
+        first_block.first_convolution_layer(batch_with_one_image)))
+    second_convolution_feature_maps = functional.relu(first_block.second_batch_normalization_layer(
+        first_block.second_convolution_layer(first_convolution_feature_maps)))
+    pooled_feature_maps = functional.max_pool2d(second_convolution_feature_maps, 2)
+    third_convolution_feature_maps = functional.relu(second_block.first_batch_normalization_layer(
+        second_block.first_convolution_layer(pooled_feature_maps)))
+
+    figure_rows = [("Input", None),
+                   ("Conv 1_1", first_convolution_feature_maps),
+                   ("Conv 1_2", second_convolution_feature_maps),
+                   ("Conv 2_1", third_convolution_feature_maps)]
+    maps_figure, maps_axes = plt.subplots(4, 8, figsize=(10, 5.6))
+    for row_index, (row_title, row_feature_maps) in enumerate(figure_rows):
+        for channel_index in range(8):
+            single_axis = maps_axes[row_index, channel_index]
+            single_axis.axis("off")
+            if row_feature_maps is None:
+                if channel_index == 0:  # Show the input image one time only.
+                    single_axis.imshow(batch_with_one_image[0, 0].cpu(), cmap="gray")
+            else:
+                single_axis.imshow(row_feature_maps[0, channel_index].cpu(), cmap="viridis")
+            if channel_index == 0:
+                single_axis.set_title(row_title, fontsize=8, loc="left")
+    maps_figure.suptitle("Feature maps for one test digit (first 8 channels per layer)")
+    maps_figure.tight_layout()
+    maps_figure.savefig(output_image_path, dpi=150)
+    plt.close(maps_figure)
+
+
+def plot_misclassified_images(test_images_array, true_labels_array, predicted_labels_array,
+                              output_image_path, maximum_number_of_images=16):
+    """Draw the first misclassified test images with true and predicted labels.
+
+    Inputs:
+        test_images_array (numpy.ndarray): All test images. Shape (N, 1, 28, 28).
+        true_labels_array (numpy.ndarray): True class for each image.
+        predicted_labels_array (numpy.ndarray): Predicted class for each image.
+        output_image_path (Path): Location of the PNG file to write.
+        maximum_number_of_images (int): Largest number of errors to draw.
+    Output:
+        None. The function writes one image file.
+    """
+    indices_of_misclassified_images = np.where(
+        true_labels_array != predicted_labels_array)[0][:maximum_number_of_images]
+    errors_figure, errors_axes = plt.subplots(2, 8, figsize=(10, 3))
+    for single_axis in errors_axes.flat:
+        single_axis.axis("off")
+    for single_axis, misclassified_image_index in zip(errors_axes.flat,
+                                                      indices_of_misclassified_images):
+        single_axis.imshow(test_images_array[misclassified_image_index, 0], cmap="gray")
+        single_axis.set_title(
+            f"T:{true_labels_array[misclassified_image_index]} "
+            f"P:{predicted_labels_array[misclassified_image_index]}", fontsize=8)
+    errors_figure.suptitle("Misclassified test digits (T = true, P = predicted)")
+    errors_figure.tight_layout()
+    errors_figure.savefig(output_image_path, dpi=150)
+    plt.close(errors_figure)
+
+
+#  main
+def compute_per_class_metrics(confusion_count_matrix):
+    """Compute precision, recall, F1 score, and support for each class.
+
+    Input:
+        confusion_count_matrix (numpy.ndarray): Matrix of shape (10, 10).
+            Rows are true classes. Columns are predicted classes.
+    Output:
+        dict: Class index (as text) -> dict with the keys
+            precision, recall, f1, and support.
+    """
+    metrics_for_each_class = {}
+    for class_index in range(NUMBER_OF_CLASSES):
+        true_positive_count = confusion_count_matrix[class_index, class_index]
+        # The maximum with 1 prevents a division by zero.
+        total_predicted_as_this_class = max(confusion_count_matrix[:, class_index].sum(), 1)
+        total_actually_this_class = max(confusion_count_matrix[class_index].sum(), 1)
+        class_precision = true_positive_count / total_predicted_as_this_class
+        class_recall = true_positive_count / total_actually_this_class
+        class_f1_score = (2 * class_precision * class_recall
+                          / max(class_precision + class_recall, 1e-12))
+        metrics_for_each_class[str(class_index)] = dict(
+            precision=class_precision, recall=class_recall, f1=class_f1_score,
+            support=int(confusion_count_matrix[class_index].sum()))
+    return metrics_for_each_class
+
+
+INCOMPLETE_RUN_REPORT_FILE_NAME = "RUN_INCOMPLETE.txt"
+
+
+def write_incomplete_run_report(run_output_directory, outcome_name,
+                                completed_component_durations_in_seconds,
+                                elapsed_seconds_before_stop, device_description,
+                                error_traceback_text=None):
+    """Write a text file in the run folder that explains why the run is incomplete.
+
+    Use this function when a run is cancelled or fails before it writes results.json.
+
+    Inputs:
+        run_output_directory (Path): The run folder to write the file in.
+        outcome_name (str): "CANCELLED" or "FAILED".
+        completed_component_durations_in_seconds (dict): Component name -> seconds.
+            Only the components that finished before the stop.
+        elapsed_seconds_before_stop (float): Time from the start of the run to the stop.
+        device_description (str): Device of this run.
+        error_traceback_text (str or None): Full error text. None for a cancellation.
+    Output:
+        None. The function writes RUN_INCOMPLETE.txt in the run folder.
+    """
+    report_lines = [
+        f"Run status: {outcome_name}",
+        f"Time of stop: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Time from start to stop: {format_duration(elapsed_seconds_before_stop)} (H:MM:SS)",
+        f"Device: {device_description}",
+        "",
+        "The run did not write results.json. This folder holds partial results only.",
+        "The next run ignores this folder when it looks for the previous run time.",
+        "",
+        "Components that finished before the stop:",
+    ]
+    if completed_component_durations_in_seconds:
+        for component_name, component_duration in completed_component_durations_in_seconds.items():
+            report_lines.append(f"  {component_name}: {format_duration(component_duration)}")
+    else:
+        report_lines.append("  None")
+    report_lines.append("")
+    report_lines.append("Files in this folder (other than this report):")
+    names_of_other_files = sorted(
+        file_path.name for file_path in run_output_directory.iterdir()
+        if file_path.name != INCOMPLETE_RUN_REPORT_FILE_NAME)
+    report_lines.extend(f"  {file_name}" for file_name in names_of_other_files)
+    if not names_of_other_files:
+        report_lines.append("  None")
+    if error_traceback_text:
+        report_lines.extend(["", "Error details:", error_traceback_text])
+    (run_output_directory / INCOMPLETE_RUN_REPORT_FILE_NAME).write_text(
+        "\n".join(report_lines) + "\n")
+
+
+def run_experiment(current_run_output_directory, completed_component_durations_in_seconds,
+                   previous_total_duration_in_seconds,
+                   previous_component_durations_in_seconds,
+                   previous_device_description, current_device_description):
+    """Run the full experiment: train, evaluate, plot, sweep, and save the results.
+
+    Inputs:
+        current_run_output_directory (Path): Folder for the files of this run.
+        completed_component_durations_in_seconds (dict): Empty dict at the start.
+            The function adds one entry as each component finishes. The caller
+            uses this dict to report the progress if the run stops early.
+        previous_total_duration_in_seconds (float or None): Total of the last run.
+        previous_component_durations_in_seconds (dict): Component times of the last run.
+        previous_device_description (str): Device of the last run, or "unknown".
+        current_device_description (str): Device of this run.
+    Output:
+        None. The function writes images, model weights, and results.json
+        to the run folder and prints progress to the console.
+    """
+    print_heading("MNIST CNN experiment")
+    print_labeled_value("Started", time.strftime("%Y-%m-%d %H:%M:%S"))
+    print_labeled_value("Device", current_device_description)
+    print_labeled_value("PyTorch", torch.__version__)
+    print_labeled_value("Output folder", current_run_output_directory)
+    print("\n  Previous run")
+    if previous_total_duration_in_seconds is None:
+        print("    None found. The duration of this run is unknown.")
+    else:
+        print_labeled_value("Device", previous_device_description, indent_in_characters=4)
+        print_labeled_value("Total time", format_duration(previous_total_duration_in_seconds),
+                            indent_in_characters=4)
+        if previous_device_description != current_device_description:
+            print("    Note: this run uses a different device. Expect a different duration.")
+        if previous_component_durations_in_seconds:
+            component_name_width = max(len(name) for name in previous_component_durations_in_seconds)
+            print("    Time of each component:")
+            for component_name, component_duration in previous_component_durations_in_seconds.items():
+                print(f"      {component_name:<{component_name_width}}  "
+                      f"{format_duration(component_duration):>7}")
+        else:
+            print("    Note: this older result file has the main training time only.")
+    whole_run_start_time_in_seconds = time.time()
+    component_durations_in_seconds = completed_component_durations_in_seconds  # Shared with the caller.
+    component_start_time_in_seconds = time.time()
+    print_section_header(1, NUMBER_OF_RUN_SECTIONS, "Loading and splitting the MNIST data")
+
+    (training_images_tensor, training_labels_tensor,
+     test_images_tensor, test_labels_tensor) = load_mnist_data()
+    full_training_dataset = TensorDataset(training_images_tensor, training_labels_tensor)
+    # Use 54,000 images for training and 6,000 for validation.
+    training_dataset, validation_dataset = random_split(
+        full_training_dataset, [54000, 6000],
+        generator=torch.Generator().manual_seed(RANDOM_SEED))
+    test_data_loader = DataLoader(
+        TensorDataset(test_images_tensor, test_labels_tensor), batch_size=1000)
+    component_start_time_in_seconds = record_component_duration(
+        component_durations_in_seconds, "Data loading and splitting",
+        component_start_time_in_seconds)
+
+    base_model_configuration = dict(
+        first_block_channels=32, second_block_channels=64, hidden_units=128,
+        convolution_dropout=0.1, fully_connected_dropout=0.4,
+        learning_rate=1e-3, weight_decay=1e-4, batch_size=128, use_augmentation=True)
+
+    # Train the main model.
+    print_section_header(2, NUMBER_OF_RUN_SECTIONS, "Training the main model")
+    training_start_time_in_seconds = time.time()
+    main_trained_model, main_training_history = train_model(
+        base_model_configuration, training_dataset, validation_dataset,
+        maximum_number_of_epochs=30, early_stopping_patience_in_epochs=5)
+    training_duration_in_seconds = time.time() - training_start_time_in_seconds
+    component_start_time_in_seconds = record_component_duration(
+        component_durations_in_seconds, "Main model training",
+        component_start_time_in_seconds)
+    print_section_header(3, NUMBER_OF_RUN_SECTIONS, "Evaluating the main model and saving it")
+    plot_training_history(main_training_history, current_run_output_directory / "training_curves.png")
+    torch.save(main_trained_model.state_dict(), current_run_output_directory / "best_model.pt")
+
+    # Evaluate the main model on all three data sets.
+    _, final_training_accuracy, _, _ = evaluate_model(
+        main_trained_model, DataLoader(training_dataset, batch_size=1000))
+    _, final_validation_accuracy, _, _ = evaluate_model(
+        main_trained_model, DataLoader(validation_dataset, batch_size=1000))
+    (final_test_loss, final_test_accuracy,
+     test_predicted_labels, test_true_labels) = evaluate_model(main_trained_model, test_data_loader)
+
+    test_confusion_matrix = compute_confusion_matrix(test_true_labels, test_predicted_labels)
+    plot_confusion_matrix(test_confusion_matrix, current_run_output_directory / "confusion_matrix.png")
+    per_class_metrics = compute_per_class_metrics(test_confusion_matrix)
+    total_trainable_parameter_count = sum(
+        parameter_tensor.numel() for parameter_tensor in main_trained_model.parameters())
+    print_labeled_value("Train accuracy", f"{final_training_accuracy:.2%}")
+    print_labeled_value("Validation acc.", f"{final_validation_accuracy:.2%}")
+    print_labeled_value("Test accuracy",
+                        f"{final_test_accuracy:.2%}  (loss {final_test_loss:.4f})")
+    print_labeled_value("Parameters", f"{total_trainable_parameter_count:,}")
+    print_labeled_value("Training time", format_duration(training_duration_in_seconds))
+    component_start_time_in_seconds = record_component_duration(
+        component_durations_in_seconds, "Main model evaluation and saving",
+        component_start_time_in_seconds)
+
+    print_section_header(4, NUMBER_OF_RUN_SECTIONS, "Creating the analysis plots")
+    plot_first_layer_filters(main_trained_model, current_run_output_directory / "filters.png")
+    plot_feature_maps(main_trained_model, test_images_tensor[0],
+                      current_run_output_directory / "feature_maps.png")
+    plot_misclassified_images(test_images_tensor.numpy(), test_true_labels,
+                              test_predicted_labels,
+                              current_run_output_directory / "misclassified.png")
+    component_start_time_in_seconds = record_component_duration(
+        component_durations_in_seconds, "Analysis plots",
+        component_start_time_in_seconds)
+
+    #  Hyperparameter sweep. Change one setting at a time. Use short training runs.
+    candidate_values_for_each_setting = {
+        "learning_rate": [1e-4, 1e-3, 1e-2],
+        "fully_connected_dropout": [0.0, 0.4, 0.7],
+        "batch_size": [32, 128, 512],
+        "second_block_channels": [16, 64, 128],
+        "use_augmentation": [False, True],
+    }
+    print_section_header(5, NUMBER_OF_RUN_SECTIONS, "Hyperparameter sweep")
+    sweep_results_for_each_setting = {}
+    total_sweep_run_count = sum(
+        len(list_of_values) for list_of_values in candidate_values_for_each_setting.values())
+    completed_sweep_run_count = 0
+    sweep_start_time_in_seconds = time.time()
+    print(f"  {total_sweep_run_count} short training runs. Each run changes one setting.")
+    print_progress_bar(0, total_sweep_run_count, sweep_start_time_in_seconds, "  sweep runs")
+    for setting_name, list_of_candidate_values in candidate_values_for_each_setting.items():
+        sweep_results_for_each_setting[setting_name] = []
+        for candidate_value in list_of_candidate_values:
+            # Copy the base configuration. Replace only the setting under test.
+            sweep_model_configuration = dict(
+                base_model_configuration, **{setting_name: candidate_value})
+            sweep_trained_model, sweep_training_history = train_model(
+                sweep_model_configuration, training_dataset, validation_dataset,
+                maximum_number_of_epochs=8, early_stopping_patience_in_epochs=3,
+                print_progress=False)
+            _, sweep_test_accuracy, _, _ = evaluate_model(sweep_trained_model, test_data_loader)
+            sweep_results_for_each_setting[setting_name].append(dict(
+                value=candidate_value,
+                test_acc=sweep_test_accuracy,
+                final_train_acc=sweep_training_history["train_acc"][-1],
+                best_val_acc=max(sweep_training_history["val_acc"])))
+            completed_sweep_run_count += 1
+            clear_console_line()  # Remove the open progress bar. Print the result line first.
+            print(f"  [{completed_sweep_run_count:>2}/{total_sweep_run_count}] "
+                  f"{setting_name:<23} = {str(candidate_value):<7} "
+                  f"test accuracy {sweep_test_accuracy:.2%}")
+            print_progress_bar(completed_sweep_run_count, total_sweep_run_count,
+                               sweep_start_time_in_seconds, "  sweep runs")
+    component_start_time_in_seconds = record_component_duration(
+        component_durations_in_seconds, "Hyperparameter sweep (14 runs)",
+        component_start_time_in_seconds)
+
+    print_section_header(6, NUMBER_OF_RUN_SECTIONS, "Saving the sweep plot and the results")
+    sweep_figure, sweep_axes = plt.subplots(
+        1, len(candidate_values_for_each_setting), figsize=(16, 3.4))
+    for single_axis, (setting_name, list_of_result_dictionaries) in zip(
+            sweep_axes, sweep_results_for_each_setting.items()):
+        single_axis.plot(
+            [str(result_dictionary["value"]) for result_dictionary in list_of_result_dictionaries],
+            [result_dictionary["test_acc"] for result_dictionary in list_of_result_dictionaries],
+            "o-")
+        single_axis.set(title=setting_name, xlabel=setting_name, ylabel="Test accuracy")
+        single_axis.grid(alpha=0.3)
+    sweep_figure.tight_layout()
+    sweep_figure.savefig(current_run_output_directory / "hyperparameter_sweep.png", dpi=150)
+    plt.close(sweep_figure)
+    component_start_time_in_seconds = record_component_duration(
+        component_durations_in_seconds, "Sweep plot", component_start_time_in_seconds)
+
+    #  Save all numbers for the report.
+    # The keys total_run_time_s and component_durations_s give the next run its expected durations.
+    total_run_duration_in_seconds = time.time() - whole_run_start_time_in_seconds
+    results_dictionary = dict(
+        device=current_device_description,
+        total_run_time_s=total_run_duration_in_seconds,
+        component_durations_s=component_durations_in_seconds,
+        config=base_model_configuration, params=total_trainable_parameter_count,
+        epochs_run=len(main_training_history["train_loss"]),
+        train_time_s=training_duration_in_seconds,
+        train_acc=final_training_accuracy, val_acc=final_validation_accuracy,
+        test_acc=final_test_accuracy, test_loss=final_test_loss,
+        per_class=per_class_metrics,
+        confusion=test_confusion_matrix.tolist(),
+        num_errors=int((test_predicted_labels != test_true_labels).sum()),
+        sweep=sweep_results_for_each_setting)
+    (current_run_output_directory / "results.json").write_text(
+        json.dumps(results_dictionary, indent=2, default=float))
+    print(f"  Results saved to: {current_run_output_directory}")
+    print_duration_summary(component_durations_in_seconds, total_run_duration_in_seconds,
+                           previous_component_durations_in_seconds,
+                           previous_total_duration_in_seconds,
+                           current_device_description, previous_device_description)
+
+
+def main():
+    """Start a new run and write a report file if the run is cancelled or fails.
+
+    The function creates the run folder, then calls run_experiment.
+    If the user cancels (Ctrl+C) or an error occurs, the function writes
+    RUN_INCOMPLETE.txt in the run folder and then raises the same exception again,
+    so the console still shows the stop reason.
+    A forced stop (closed terminal, killed process, power loss) cannot be caught.
+    Such a run folder has neither results.json nor a report file.
+
+    Input:
+        None. The optional command-line option --device (cpu, gpu, or cuda:N)
+        skips the question and sets the device.
+    Output:
+        None.
+    """
+    global COMPUTE_DEVICE  # The functions of this file read this value when they run.
+    argument_parser = argparse.ArgumentParser(description="Train and analyze the MNIST CNN.")
+    argument_parser.add_argument(
+        "--device", default=None,
+        help="Device to use: cpu, gpu, or cuda:N. Without this option the script asks "
+             "when more than one device is available.")
+    parsed_arguments = argument_parser.parse_args()
+    try:
+        COMPUTE_DEVICE = select_compute_device(parsed_arguments.device)
+    except KeyboardInterrupt:
+        print("\n  Cancelled before the run started. No run folder was created.")
+        return
+
+    # Read the previous durations before this run creates its own folder.
+    (previous_total_duration_in_seconds,
+     previous_component_durations_in_seconds,
+     previous_device_description) = load_previous_run_timings()
+    current_device_description = describe_compute_device()
+    current_run_output_directory = create_new_run_directory()
+    completed_component_durations_in_seconds = {}  # The run fills this dict.
+    main_start_time_in_seconds = time.time()
+    try:
+        run_experiment(current_run_output_directory, completed_component_durations_in_seconds,
+                       previous_total_duration_in_seconds,
+                       previous_component_durations_in_seconds,
+                       previous_device_description, current_device_description)
+    except KeyboardInterrupt:
+        write_incomplete_run_report(
+            current_run_output_directory, "CANCELLED",
+            completed_component_durations_in_seconds,
+            time.time() - main_start_time_in_seconds, current_device_description)
+        print(f"\nRun cancelled. Report: "
+              f"{current_run_output_directory / INCOMPLETE_RUN_REPORT_FILE_NAME}")
+        raise
+    except Exception:
+        write_incomplete_run_report(
+            current_run_output_directory, "FAILED",
+            completed_component_durations_in_seconds,
+            time.time() - main_start_time_in_seconds, current_device_description,
+            error_traceback_text=traceback.format_exc())
+        print(f"\nRun failed. Report: "
+              f"{current_run_output_directory / INCOMPLETE_RUN_REPORT_FILE_NAME}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
