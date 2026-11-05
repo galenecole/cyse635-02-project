@@ -1,0 +1,14 @@
+Run status: CANCELLED
+Time of stop: 2026-11-04 21:21:17
+Time from start to stop: 17:27:41 (H:MM:SS)
+Device: GPU: NVIDIA GeForce RTX 3070 (8.0 GB)
+
+The run did not write results.json. This folder holds partial results only.
+The next run ignores this folder when it looks for the previous run time.
+
+Components that finished before the stop:
+  Data loading and splitting: 0:00:00
+  Main model training: 0:02:33
+
+Files in this folder (other than this report):
+  ensemble_member_1.pt
